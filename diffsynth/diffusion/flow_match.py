@@ -1,8 +1,29 @@
+"""
+Flow Matching 调度器（scheduler）。
+
+本模块以 `sigma`（噪声强度）参数化扩散/流匹配过程，并为训练提供：
+  - `add_noise(x0, ε, t)`：构造带噪样本 `xt`
+  - `training_target(x0, ε, t)`：构造监督目标 `target`
+  - `training_weight(t)`：按 timestep 对 loss 加权（经验权重）
+
+在 Wan 的 SFT 训练中，loss 入口见：`diffsynth.diffusion.loss.FlowMatchSFTLoss`。
+"""
+
 import torch, math
 from typing_extensions import Literal
 
 
 class FlowMatchScheduler():
+    """Flow Matching 训练/推理共用的 scheduler。
+
+    术语约定：
+      - `sigmas`：每个 timestep 对应的噪声强度 σ（通常从大到小）。
+      - `timesteps`：以 “σ * num_train_timesteps” 表示的连续时间标尺（长度与 `sigmas` 一致）。
+
+    注意：
+      - 训练模式需要调用 `set_timesteps(..., training=True)`，以便初始化 `linear_timesteps_weights`，
+        否则 `training_weight(...)` 没有可用的权重表。
+    """
 
     def __init__(self, template: Literal["FLUX.1", "Wan", "Qwen-Image", "FLUX.2", "Z-Image"] = "FLUX.1"):
         self.set_timesteps_fn = {
@@ -118,6 +139,15 @@ class FlowMatchScheduler():
         return sigmas, timesteps
     
     def set_training_weight(self):
+        """构造训练用的 timestep 权重曲线（经验公式）。
+
+        直观目标：让中间 timestep（噪声程度适中、学习信号更强）权重更高，两端权重较低。
+
+        实现要点：
+          - 对 `self.timesteps` 计算一个高斯形状的权重 `y`；
+          - 平移到非负后归一化，使权重总和约等于 `steps`；
+          - 当 timestep 数不为 1000 时，用经验修正缩放/平移权重。
+        """
         steps = 1000
         x = self.timesteps
         y = torch.exp(-2 * ((x - steps / 2) / steps) ** 2)
@@ -162,6 +192,15 @@ class FlowMatchScheduler():
         return model_output
     
     def add_noise(self, original_samples, noise, timestep):
+        """根据 timestep 对干净样本加噪，得到 `xt`。
+
+        公式（σ 由 timestep 查表得到）：
+            xt = (1 - σ) * x0 + σ * ε
+
+        说明：
+          - 这里通过 `argmin(|self.timesteps - timestep|)` 将连续 `timestep` 映射到离散索引；
+          - 若 `timestep` 在 GPU 上，会先转回 CPU，以与 `self.timesteps` 的 device 对齐。
+        """
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
         timestep_id = torch.argmin((self.timesteps - timestep).abs())
@@ -170,10 +209,22 @@ class FlowMatchScheduler():
         return sample
     
     def training_target(self, sample, noise, timestep):
+        """FlowMatch 训练目标的构造。
+
+        对 Wan/本实现的 Flow Matching，监督目标为：
+            target = ε - x0
+
+        其中：
+          - `sample` 对应 `x0`（干净样本/真实 latent）
+          - `noise` 对应 `ε`
+
+        `timestep` 参数保留是为了接口统一（部分变体可能与 timestep 相关）。
+        """
         target = noise - sample
         return target
     
     def training_weight(self, timestep):
+        """返回某个 timestep 对应的训练权重（用于对 loss 加权）。"""
         timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
         weights = self.linear_timesteps_weights[timestep_id]
         return weights

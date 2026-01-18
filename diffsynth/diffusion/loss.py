@@ -1,21 +1,53 @@
+"""
+训练损失函数集合。
+
+本文件聚合了与具体 `PipelineUnit` 解耦的 loss 计算逻辑。一般训练流程为：
+  1) `DiffusionTrainingModule.forward(...)` 先运行 pipeline units，构造 `inputs_shared/inputs_posi/inputs_nega`；
+  2) 再在这里根据 task 选择 loss，返回一个标量 `torch.Tensor`；
+  3) 外部训练循环对该 loss 做 `backward()` 并更新（通常只更新 LoRA 参数）。
+"""
+
 from .base_pipeline import BasePipeline
 import torch
 
 
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
+    """Flow Matching 的 SFT（supervised fine-tuning）损失。
+
+    直观理解（以 latent 空间为例）：
+      - `x0 = input_latents`：由 VAE 编码得到的“干净/真实”latent（训练数据对应的目标）。
+      - 采样一个训练 timestep，并根据 scheduler 取到对应的 `sigma`。
+      - 用噪声 `ε ~ N(0, I)` 构造带噪 latent：
+            xt = (1 - σ) * x0 + σ * ε
+      - FlowMatch 的训练目标（由 scheduler 定义，这里为 Wan/FlowMatchScheduler）：
+            target = ε - x0
+      - DiT（通过 `pipe.model_fn`）在输入 `xt` 与条件（prompt/image/control 等）下预测 `target`，
+        并用 MSE 监督，最后乘以一个 timestep 权重（强调中间 timestep）。
+
+    需要的关键输入（由 pipeline units 产出并写入 `inputs`）：
+      - `input_latents`：`x0`，真实视频/图像经 VAE 编码后的 latent。
+      - 以及 `pipe.model_fn` 所需的条件输入（例如 prompt embedding、control latents 等）。
+
+    返回：
+      - 标量 loss（已乘以 `pipe.scheduler.training_weight(timestep)`）。
+    """
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
 
+    # 采样一个训练 timestep（这里按“索引区间”采样，再映射到实际 timestep 值）。
     timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
     timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
     
+    # 生成噪声并构造带噪 latent（xt）。注意：这里会覆盖 `inputs["latents"]`，以确保后续模型看到的是 xt。
     noise = torch.randn_like(inputs["input_latents"])
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
     
+    # 收集本次迭代需要参与 forward 的模型（例如 `dit`），并调用统一的 `model_fn` 得到预测。
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
     
+    # MSE 在 float32 上计算更稳定；之后再乘以 timestep 权重（通常来自 scheduler 的经验权重曲线）。
     loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
     loss = loss * pipe.scheduler.training_weight(timestep)
     return loss
