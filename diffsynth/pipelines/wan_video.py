@@ -1,3 +1,27 @@
+"""
+Wan-Video Pipeline。
+
+`WanVideoPipeline` 是 Wan 系列视频模型（Wan2.1/Wan2.2 及其变体：I2V/T2V/TI2V/S2V/VACE/Fun/Animate/...）
+的统一推理/训练流水线。
+
+设计概览
+--------
+Pipeline 由一组 *Pipeline Units*（`self.units`）顺序组成。每个 unit 都消费并产出统一的
+`(inputs_shared, inputs_posi, inputs_nega)` 风格三元组，因此推理与训练可以通过遍历 units
+复用同一张计算图（训练阶段再由外层 loss 负责反传）。
+
+模型加载通过 `from_pretrained(...)` + `ModelConfig` 列表完成。底层 loader 支持：
+  - 远程下载（ModelScope / HuggingFace）：`model_id + origin_file_pattern`
+  - 本地加载：显式 `path`
+  - 显存管理 / offload 选项：以字段形式嵌入 `ModelConfig`
+
+阅读建议
+--------
+1) `WanVideoPipeline.__call__`：推理端主流程（units → 去噪循环 → post_units → VAE decode）。
+2) `WanVideoUnit_*`：各类条件（I2V/TI2V/V2V/S2V/VACE/VAP/Animate/Camera 等）如何映射到统一输入字典。
+3) `model_fn_wan_video`：单步去噪前向（DiT + 可选 VACE/VAP/Animate/USP/TeaCache 等分支）。
+"""
+
 import torch, types
 import numpy as np
 from PIL import Image
@@ -29,6 +53,16 @@ from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 
 
 class WanVideoPipeline(BasePipeline):
+    """Wan 系列视频生成 Pipeline。
+
+    关键输入（随模型变体不同而变化）：
+      - `prompt` / `negative_prompt`
+      - `input_video`（训练）或为空（纯生成）
+      - `input_image`（I2V/TI2V）、`end_image`（InP）、`input_audio`（S2V）等
+
+    关键输出：
+      - 生成的视频帧序列（经 VAE / post units 后处理）
+    """
 
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
         super().__init__(
@@ -82,6 +116,11 @@ class WanVideoPipeline(BasePipeline):
 
 
     def enable_usp(self):
+        """启用 Unified Sequence Parallel（USP）加速。
+
+        该函数会就地 patch attention 与 DiT 的 forward，使其使用 USP 版本实现。
+        需要先初始化 USP runtime（见 `from_pretrained` 的 `use_usp` 分支）。
+        """
         from ..utils.xfuser import get_sequence_parallel_world_size, usp_attn_forward, usp_dit_forward
 
         for block in self.dit.blocks:
@@ -106,8 +145,24 @@ class WanVideoPipeline(BasePipeline):
         use_usp: bool = False,
         vram_limit: float = None,
     ):
+        """从 `model_configs` 加载模型并创建 `WanVideoPipeline`。
+
+        输入：
+          - `model_configs`：`ModelConfig` 列表，指向所需文件（DiT、text encoder、VAE 等）。
+            每个 config 也可包含显存管理字段（offload/onload/preparing/computation）。
+          - `tokenizer_config`：默认使用 Wan 的 UMT5 tokenizer。
+          - `audio_processor_config`：仅 S2V 需要；为空则使用默认配置。
+          - `redirect_common_files`：为 True 时，将部分公共 `.pth` 资源重定向到共享的
+            converted-safetensors 仓库，避免重复下载。
+          - `use_usp`：启用 USP runtime，并 patch forward（见 `enable_usp`）。
+          - `vram_limit`：loader 使用的可选显存上限目标值。
+
+        输出：
+          - 一个完成初始化的 pipeline 实例；各组件绑定在 `pipe.dit`、`pipe.text_encoder`、`pipe.vae` 等属性上。
+        """
         # Redirect model path
         if redirect_common_files:
+            # 一些 Wan checkpoint 会引用公共 `.pth` 资源；重定向到统一的 converted-safetensors 仓库可节省带宽与磁盘空间。
             redirect_dict = {
                 "models_t5_umt5-xxl-enc-bf16.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "models_t5_umt5-xxl-enc-bf16.safetensors"),
                 "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth": ("DiffSynth-Studio/Wan-Series-Converted-Safetensors", "models_clip_open-clip-xlm-roberta-large-vit-huge-14.safetensors"),
@@ -247,10 +302,40 @@ class WanVideoPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
         output_type: Optional[Literal["quantized", "floatpoint"]] = "quantized",
     ):
+        """执行一次 WanVideo 推理（`no_grad`）。
+
+        该接口是“推理端”的统一入口：将用户侧高层条件（prompt / 图像 / 视频 / 音频 / 控制信号等）
+        归一化到 `inputs_shared / inputs_posi / inputs_nega` 三元组，然后：
+
+        1) 依次执行 `self.units`：完成尺寸对齐、VAE 编码、文本/图像/音频条件编码、CFG 合并等预处理；
+        2) 在 `self.scheduler.timesteps` 上循环：调用 `self.model_fn` 预测噪声并更新 `latents`；
+        3) 执行 `self.post_units`：做 post-denoise 的时序拼接等；
+        4) VAE decode：把 `latents` 解码为视频帧序列并按 `output_type` 返回。
+
+        输入（按功能分组，具体是否生效由模型变体与 unit 决定）：
+          - 文本：`prompt` / `negative_prompt`
+          - I2V/TI2V：`input_image`（可选 `end_image` 作为首尾帧条件）
+          - V2V：`input_video` + `denoising_strength`（控制起始噪声强度）
+          - S2V：`input_audio` 或预计算 `audio_embeds`，可选 `s2v_pose_*` 与 `motion_video`
+          - 控制：`control_video` / `reference_image` / camera control / VACE / Animate / VAP / LongCat 等
+          - 采样：`seed` / `rand_device` / `num_inference_steps` / `sigma_shift` / CFG / sliding window / TeaCache
+
+        输出：
+          - `output_type="quantized"`：通常为可视化友好的帧序列（内部由 `vae_output_to_video` 转换）。
+          - `output_type="floatpoint"`：保留 float tensor（当前实现不做额外处理）。
+
+        训练侧注意：
+          - 训练入口在 `examples/wanvideo/model_training/train.py`：直接遍历 `pipe.units` 并计算 loss，
+            不走本函数的去噪循环与 decode。
+        """
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
         # Inputs
+        # 设计约定：
+        # - `inputs_shared`：正/负提示词共享的输入（图像/视频/latent/控制信号等）
+        # - `inputs_posi`：仅正向分支使用的输入（如 prompt embedding）
+        # - `inputs_nega`：仅负向分支使用的输入（如 negative prompt embedding）
         inputs_posi = {
             "prompt": prompt,
             "vap_prompt": vap_prompt,
@@ -300,6 +385,7 @@ class WanVideoPipeline(BasePipeline):
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
                 if cfg_merge:
+                    # `WanVideoUnit_CfgMerger` 将正/负输入沿 batch 合并，model_fn 单次前向输出 2B。
                     noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
                 else:
                     noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
@@ -310,6 +396,7 @@ class WanVideoPipeline(BasePipeline):
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
+                # 部分 TI2V（fused embedding）会把首帧 latent 作为强条件：每步都强制写回，避免被去噪漂移。
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
         
         # VACE (TODO: remove it)
@@ -335,6 +422,19 @@ class WanVideoPipeline(BasePipeline):
 
 
 class WanVideoUnit_ShapeChecker(PipelineUnit):
+    """尺寸对齐与合法性检查。
+
+    目的：
+      - 将用户输入的 `height/width/num_frames` 对齐到 pipeline 约束的整除关系：
+        * 空间维度：`height_division_factor / width_division_factor`
+        * 时间维度：`time_division_factor / time_division_remainder`
+
+    输入：
+      - `height`, `width`, `num_frames`：用户期望的输出形状。
+
+    输出：
+      - 更新后的 `height`, `width`, `num_frames`（必要时会向上取整并打印提示）。
+    """
     def __init__(self):
         super().__init__(
             input_params=("height", "width", "num_frames"),
@@ -348,6 +448,17 @@ class WanVideoUnit_ShapeChecker(PipelineUnit):
 
 
 class WanVideoUnit_NoiseInitializer(PipelineUnit):
+    """初始化去噪起点的高斯噪声（latent 空间）。
+
+    输入：
+      - `height/width/num_frames`：最终视频的像素形状（已通过 `WanVideoUnit_ShapeChecker` 对齐）。
+      - `seed/rand_device`：随机数控制。
+      - `vace_reference_image`：若提供，会额外为 reference 帧预留 latent 时间步，并做一次时间维重排，
+        以对齐后续 VACE reference latents 的拼接方式。
+
+    输出：
+      - `noise`：形状约为 `BCTHW`，其中 `T = (num_frames - 1) // 4 + 1`（时间下采样因子 4）。
+    """
     def __init__(self):
         super().__init__(
             input_params=("height", "width", "num_frames", "seed", "rand_device", "vace_reference_image"),
@@ -368,6 +479,19 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
 
 
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
+    """将 `input_video`（V2V）编码到 latent，并据此构造初始 `latents`。
+
+    行为分支：
+      - 纯生成（`input_video is None`）：直接把 `noise` 作为初始 `latents`。
+      - V2V 推理（`input_video` 非空且 `pipe.scheduler.training == False`）：
+        先 VAE encode 得到 `input_latents`，再用 scheduler 在起始 timestep 处加噪，得到初始 `latents`。
+      - 训练（`pipe.scheduler.training == True`）：
+        返回 `input_latents` 供 loss 使用；`latents` 仍为纯噪声起点。
+
+    额外说明：
+      - 若提供 `vace_reference_image`，会先编码 reference image 并在时间维（dim=2）前拼接，
+        使后续 `vace_context` 与 `latents` 在时间对齐。
+    """
     def __init__(self):
         super().__init__(
             input_params=("input_video", "noise", "tiled", "tile_size", "tile_stride", "vace_reference_image"),
@@ -396,6 +520,23 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
 
 
 class WanVideoUnit_PromptEmbedder(PipelineUnit):
+    """文本提示词编码（CFG 分离模式）。
+
+    模式：
+      - `seperate_cfg=True`：runner 会分别对正向（`prompt`）与负向（`negative_prompt`）调用一次 `process`，
+        从而生成各自的 `context`；当 `cfg_scale == 1` 时，负向侧复用正向输出以节省一次编码。
+
+    输入：
+      - 正向：`prompt`
+      - 负向：`negative_prompt`
+
+    输出：
+      - `context`：文本 encoder 输出的 embedding（会被 `model_fn_wan_video` 的 `dit.text_embedding` 再映射一次）。
+
+    备注：
+      - runner 还会传入一个名为 `positive` 的参数（来自 `input_params_posi/nega`），此处未使用，
+        主要用于与其他 pipeline 的 unit 签名保持兼容。
+    """
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
@@ -423,6 +564,17 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
 
 
 class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
+    """CLIP 图像条件编码（可选）。
+
+    触发条件：
+      - `input_image` 非空
+      - `pipe.image_encoder` 已加载
+      - `pipe.dit.require_clip_embedding == True`
+
+    行为：
+      - 编码 `input_image` 为 `clip_feature`；
+      - 若提供 `end_image` 且 `pipe.dit.has_image_pos_emb`，则将首/尾两张图的特征在 token 维拼接。
+    """
     def __init__(self):
         super().__init__(
             input_params=("input_image", "end_image", "height", "width"),
@@ -446,6 +598,16 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
 
 
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
+    """VAE 图像条件编码（I2V/TI2V 首尾帧条件）。
+
+    输出的 `y` 是 DiT 的额外条件通道，通常由两部分拼接得到：
+      1) mask：指示哪些帧位置是“给定的条件帧”（默认首帧为 1，其他为 0；若有 `end_image` 则末帧也为 1）
+      2) VAE latent：将（首帧 + 中间全 0 帧 [+ 末帧]）拼成一个伪视频后 VAE encode 得到
+
+    触发条件：
+      - `input_image` 非空
+      - `pipe.dit.require_vae_embedding == True`
+    """
     def __init__(self):
         super().__init__(
             input_params=("input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
@@ -484,6 +646,9 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
     """
     Encode input image to latents using VAE. This unit is for Wan-AI/Wan2.2-TI2V-5B.
     """
+    # 中文补充说明：
+    # - 该变体不走 `y` 通道，而是把首帧 latent 直接写入 `latents[:, :, 0:1]`，并通过
+    #   `fuse_vae_embedding_in_latents=True` 触发 `model_fn_wan_video` 的特殊 timestep 处理分支。
     def __init__(self):
         super().__init__(
             input_params=("input_image", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
@@ -503,6 +668,16 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
 
 
 class WanVideoUnit_FunControl(PipelineUnit):
+    """Fun 系列控制视频（control_video）的 VAE 编码与通道拼接。
+
+    作用：
+      - 将 `control_video` 编码成 latent 并拼到 `y` 的通道维，使 DiT 具备“控制分支”的条件输入。
+      - 当 `clip_feature/y` 尚未由其他 unit 产生时，补齐零张量作为占位（保持维度一致）。
+
+    输出：
+      - `y`：`control_latents` 与原 `y` 拼接后的结果
+      - `clip_feature`：若原本为空则补零，否则原样透传
+    """
     def __init__(self):
         super().__init__(
             input_params=("control_video", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride", "clip_feature", "y", "latents"),
@@ -529,6 +704,13 @@ class WanVideoUnit_FunControl(PipelineUnit):
 
 
 class WanVideoUnit_FunReference(PipelineUnit):
+    """Fun 系列 reference image 条件。
+
+    作用：
+      - 将 `reference_image` VAE encode 为 `reference_latents`，在 `model_fn_wan_video` 中会被拼到
+        patch token 序列的最前面（相当于额外的“参考帧 token”）。
+      - 若 `pipe.image_encoder` 存在，也会同时产出 `clip_feature` 作为图像语义条件。
+    """
     def __init__(self):
         super().__init__(
             input_params=("reference_image", "height", "width", "reference_image"),
@@ -552,6 +734,15 @@ class WanVideoUnit_FunReference(PipelineUnit):
 
 
 class WanVideoUnit_FunCameraControl(PipelineUnit):
+    """相机轨迹控制（camera control）。
+
+    产物：
+      - `control_camera_latents_input`：相机轨迹对应的额外 latent 输入（由 `control_adapter` 生成并重排）。
+      - `y`：I2V 首帧条件所需的 VAE embedding（当 channel 不匹配时会回退到“带 mask 的 y”形式）。
+
+    注意：
+      - 该 unit 依赖 `pipe.dit.control_adapter.process_camera_coordinates`。
+    """
     def __init__(self):
         super().__init__(
             input_params=("height", "width", "num_frames", "camera_control_direction", "camera_control_speed", "camera_control_origin", "latents", "input_image", "tiled", "tile_size", "tile_stride"),
@@ -603,6 +794,10 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
 
 
 class WanVideoUnit_SpeedControl(PipelineUnit):
+    """速度桶（motion bucket）条件预处理。
+
+    将 python int 的 `motion_bucket_id` 转为模型期望的 `torch.Tensor`（dtype/device 对齐）。
+    """
     def __init__(self):
         super().__init__(
             input_params=("motion_bucket_id",),
@@ -618,6 +813,15 @@ class WanVideoUnit_SpeedControl(PipelineUnit):
 
 
 class WanVideoUnit_VACE(PipelineUnit):
+    """VACE 条件构建（视频/掩码/参考帧 → `vace_context`）。
+
+    VACE（视频条件增强）通常需要三类信息：
+      - `vace_video`：待约束的视频内容（像素空间）
+      - `vace_video_mask`：激活区域（1 表示 reactive，0 表示 inactive）
+      - `vace_reference_image`：可选的参考帧（会在时间维前拼接）
+
+    本 unit 会把它们编码并拼成统一的 `vace_context`（供 `VaceWanModel` 在 transformer 层内注入提示）。
+    """
     def __init__(self):
         super().__init__(
             input_params=("vace_video", "vace_video_mask", "vace_reference_image", "vace_scale", "height", "width", "num_frames", "tiled", "tile_size", "tile_stride"),
@@ -681,6 +885,19 @@ class WanVideoUnit_VACE(PipelineUnit):
 
 
 class WanVideoUnit_VAP(PipelineUnit):
+    """VAP 条件（接管模式）。
+
+    模式：
+      - `take_over=True`：unit 直接接管 `(inputs_shared, inputs_posi, inputs_nega)` 的读写，
+        适合需要同时改写 shared 与 posi/nega 的复杂预处理。
+
+    作用：
+      - 编码 `vap_prompt / negative_vap_prompt` → `context_vap`（分别写入 posi/nega）。
+      - 编码 `vap_video`：
+        * `vap_clip_feature`：首/尾帧 CLIP 特征（写入 shared）
+        * `vap_hidden_state`：视频 latent 与 `y` 条件拼接后的隐藏状态（写入 shared）
+      - `model_fn_wan_video` 在 `vap is not None` 时会走 VAP 分支，并在指定层做额外交互。
+    """
     def __init__(self):
         super().__init__(
             take_over=True,
@@ -759,6 +976,7 @@ class WanVideoUnit_VAP(PipelineUnit):
 
 
 class WanVideoUnit_UnifiedSequenceParallel(PipelineUnit):
+    """把 pipeline 的 USP 配置显式写入 inputs（供 `model_fn_wan_video` 使用）。"""
     def __init__(self):
         super().__init__(input_params=(), output_params=("use_unified_sequence_parallel",))
 
@@ -771,6 +989,11 @@ class WanVideoUnit_UnifiedSequenceParallel(PipelineUnit):
 
 
 class WanVideoUnit_TeaCache(PipelineUnit):
+    """TeaCache 推理加速（CFG 分离模式）。
+
+    TeaCache 会在 transformer blocks 内基于 timestep embedding 的变化趋势判断是否跳过计算，
+    通过复用上一轮 residual 来近似更新 hidden states，从而减少部分步数的计算量。
+    """
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
@@ -787,6 +1010,17 @@ class WanVideoUnit_TeaCache(PipelineUnit):
 
 
 class WanVideoUnit_CfgMerger(PipelineUnit):
+    """CFG 合并（接管模式，用于一次前向同时计算正/负分支）。
+
+    触发条件：
+      - `inputs_shared["cfg_merge"] == True`
+
+    行为：
+      - 将 `context/clip_feature/y/reference_latents` 等张量沿 batch 维拼成 2B：
+        * 若 tensor 在 posi/nega 里分别存在：拼接 (posi, nega)
+        * 否则若在 shared 里存在：拼接 (shared, shared)
+      - 清空 `inputs_posi/inputs_nega`，后续 `__call__` 会只调用一次 `model_fn` 并 `chunk(2)` 拆回。
+    """
     def __init__(self):
         super().__init__(take_over=True)
         self.concat_tensor_names = ["context", "clip_feature", "y", "reference_latents"]
@@ -808,6 +1042,19 @@ class WanVideoUnit_CfgMerger(PipelineUnit):
 
 
 class WanVideoUnit_S2V(PipelineUnit):
+    """Speech-to-Video（S2V）条件构建（接管模式）。
+
+    触发条件：
+      - 提供 `input_audio` 或 `audio_embeds`，且 `pipe.audio_encoder`/`pipe.audio_processor` 已加载。
+
+    作用：
+      - `process_audio`：音频 → `audio_embeds`（posi）；nega 侧用 0 向量（用于 CFG）。
+      - `process_motion_latents`：构造/编码 `motion_latents`，并标注 `drop_motion_frames`。
+      - `process_pose_cond`：可选姿态视频 → `s2v_pose_latents`（支持预计算与多段 repeat）。
+
+    输出键（写入 shared/posi/nega）：
+      - `audio_embeds`, `motion_latents`, `drop_motion_frames`, `s2v_pose_latents`
+    """
     def __init__(self):
         super().__init__(
             take_over=True,
@@ -892,6 +1139,11 @@ class WanVideoUnit_S2V(PipelineUnit):
 
 
 class WanVideoPostUnit_S2V(PipelineUnit):
+    """S2V 的 post-denoise 拼接逻辑。
+
+    当 S2V 需要保留 motion frames 时（`drop_motion_frames == False`），会把 `motion_latents`
+    拼到 `latents` 的时间维前部，保证 decode 后的视频包含完整的 motion 片段。
+    """
     def __init__(self):
         super().__init__(input_params=("latents", "motion_latents", "drop_motion_frames"))
 
@@ -903,6 +1155,11 @@ class WanVideoPostUnit_S2V(PipelineUnit):
 
 
 class WanVideoUnit_AnimateVideoSplit(PipelineUnit):
+    """Animate 分支：将 animate 条件序列按 `input_video` 长度裁剪对齐。
+
+    现有实现会把 `animate_*_video` 裁剪到 `len(input_video) - 4`，以适配后续 latent 时间长度与
+    训练/推理阶段的对齐要求。
+    """
     def __init__(self):
         super().__init__(
             input_params=("input_video", "animate_pose_video", "animate_face_video", "animate_inpaint_video", "animate_mask_video"),
@@ -924,6 +1181,7 @@ class WanVideoUnit_AnimateVideoSplit(PipelineUnit):
 
 
 class WanVideoUnit_AnimatePoseLatents(PipelineUnit):
+    """Animate 分支：姿态条件视频 → `pose_latents`（VAE latent）。"""
     def __init__(self):
         super().__init__(
             input_params=("animate_pose_video", "tiled", "tile_size", "tile_stride"),
@@ -941,6 +1199,11 @@ class WanVideoUnit_AnimatePoseLatents(PipelineUnit):
 
 
 class WanVideoUnit_AnimateFacePixelValues(PipelineUnit):
+    """Animate 分支：face 条件像素值（接管模式）。
+
+    - 正向：`face_pixel_values = preprocess_video(animate_face_video)`
+    - 负向：用 `-1` 的全零张量占位（与 preprocess 的值域对齐），用于 CFG。
+    """
     def __init__(self):
         super().__init__(
             take_over=True,
@@ -957,6 +1220,15 @@ class WanVideoUnit_AnimateFacePixelValues(PipelineUnit):
 
 
 class WanVideoUnit_AnimateInpaint(PipelineUnit):
+    """Animate 分支：inpaint 条件构建（输出 `y`）。
+
+    该 unit 会把两类条件拼成一个 `y`：
+      1) `y_ref`：由 `input_image` 编码得到的 reference（带 mask）
+      2) `y_reft`：由 `animate_inpaint_video` 编码得到的背景/序列（带 mask，来自 `animate_mask_video`）
+
+    输出：
+      - `y`：供 DiT 作为额外条件通道输入（mask + VAE latent）。
+    """
     def __init__(self):
         super().__init__(
             input_params=("animate_inpaint_video", "animate_mask_video", "input_image", "tiled", "tile_size", "tile_stride"),
@@ -1001,6 +1273,7 @@ class WanVideoUnit_AnimateInpaint(PipelineUnit):
 
 
 class WanVideoUnit_LongCatVideo(PipelineUnit):
+    """LongCat-Video 分支：长视频条件编码（`longcat_video` → `longcat_latents`）。"""
     def __init__(self):
         super().__init__(
             input_params=("longcat_video",),
@@ -1018,6 +1291,17 @@ class WanVideoUnit_LongCatVideo(PipelineUnit):
 
 
 class TeaCache:
+    """TeaCache：按步自适应跳过部分 transformer 计算的推理加速器。
+
+    高层思路：
+      - 观察每一步的 time modulation（`t_mod`）变化幅度；
+      - 若变化“足够小”（累计相对 L1 距离低于阈值），则跳过本步 blocks 计算，
+        直接用上一轮 residual 近似更新 hidden states；
+      - 否则正常计算，并在末尾存下 residual 供下一次近似更新使用。
+
+    说明：
+      - 该实现依赖不同模型规模的拟合系数（`coefficients_dict`），因此需要传入 `model_id` 指定配置。
+    """
     def __init__(self, num_inference_steps, rel_l1_thresh, model_id):
         self.num_inference_steps = num_inference_steps
         self.step = 0
@@ -1071,6 +1355,17 @@ class TeaCache:
 
 
 class TemporalTiler_BCTHW:
+    """时间维滑窗（BCTHW）推理：分段前向 + overlap-add 融合。
+
+    用途：
+      - 当视频过长导致一次前向显存压力过大时，可设置 `sliding_window_size/stride`，
+        将 `latents`（以及可选的 `y`）在时间维切成多个窗口，分别调用 `model_fn` 预测噪声，
+        再用线性 mask 对重叠区域做加权平均。
+
+    约束：
+      - 当前实现只在时间维滑窗；空间维不切片。
+      - 输入张量需为 `B C T H W`。
+    """
     def __init__(self):
         pass
 
@@ -1093,6 +1388,16 @@ class TemporalTiler_BCTHW:
         return mask
     
     def run(self, model_fn, sliding_window_size, sliding_window_stride, computation_device, computation_dtype, model_kwargs, tensor_names, batch_size=None):
+        """对给定 `tensor_names` 指定的张量做时间滑窗推理并融合输出。
+
+        参数：
+          - `model_fn`：形如 `model_fn_wan_video(**model_kwargs)` 的前向函数。
+          - `sliding_window_size/stride`：窗口大小与步长（在时间维 T 上滑动）。
+          - `computation_device/computation_dtype`：每个窗口切片搬运到该 device/dtype 后再调用 `model_fn`。
+          - `model_kwargs`：`model_fn` 的关键字参数（会被就地更新/恢复）。
+          - `tensor_names`：需要切片滑窗的张量名（例如 `["latents", "y"]`）。
+          - `batch_size`：用于 CFG merge 时的 batch 还原（输出 shape 与原张量对齐）。
+        """
         tensor_names = [tensor_name for tensor_name in tensor_names if model_kwargs.get(tensor_name) is not None]
         tensor_dict = {tensor_name: model_kwargs[tensor_name] for tensor_name in tensor_names}
         B, C, T, H, W = tensor_dict[tensor_names[0]].shape
@@ -1159,6 +1464,32 @@ def model_fn_wan_video(
     fuse_vae_embedding_in_latents: bool = False,
     **kwargs,
 ):
+    """WanVideo 的“单步去噪前向”（预测噪声/velocity）。
+
+    这是 `WanVideoPipeline.__call__` 去噪循环中每一步调用的核心函数；同时也会被训练侧 loss 复用。
+
+    关键输入（按张量语义）：
+      - `latents`：`B C T H W`，当前步的 noisy latent。
+      - `timestep`：`(1,)` 或 `B`，当前步时间索引（已映射到 scheduler 的标度）。
+      - `context`：文本 encoder 的输出（后续会经 `dit.text_embedding` 再映射一次）。
+      - `y`：可选的 VAE embedding 条件（mask + latent），会与 `latents` 在 channel 维拼接。
+      - `clip_feature`：可选的 CLIP 图像特征，会与 `context` 在 token 维拼接。
+      - `reference_latents`：可选参考帧 latent，会在 patch token 序列前拼接（影响 RoPE 长度 f）。
+      - `vace_context/vace_scale`：VACE 条件与强度，决定是否在指定 block 注入 hint。
+      - `vap_*`：VAP 条件与模型（若 `vap is not None`），在指定层做额外交互。
+      - `audio_embeds`：若非空则进入 S2V 分支（调用 `model_fn_wans2v`）。
+      - `use_unified_sequence_parallel`：若为 True 且分布式已初始化，则启用 USP 序列并行。
+
+    主要分支（按优先级）：
+      1) Sliding window：`sliding_window_size/stride` → `TemporalTiler_BCTHW`（递归调用本函数）。
+      2) LongCat：`dit` 为 `LongCatVideoTransformer3DModel` → `model_fn_longcat_video`。
+      3) S2V：`audio_embeds` 非空 → `model_fn_wans2v`。
+      4) 默认：Wan DiT（可叠加 MotionController / VACE / VAP / Animate / TeaCache / USP）。
+
+    输出：
+      - 与 `latents` 同形状的噪声预测张量（用于 scheduler.step 更新）。
+    """
+    # 若配置了 sliding window，则把时间维切片成多个窗口分别前向，并对重叠区域做加权融合（降低峰值显存）。
     if sliding_window_size is not None and sliding_window_stride is not None:
         model_kwargs = dict(
             dit=dit,
@@ -1184,6 +1515,7 @@ def model_fn_wan_video(
             tensor_names=["latents", "y"],
             batch_size=2 if cfg_merge else 1
         )
+    # LongCat-Video 使用独立的 transformer 接口与条件拼接方式，走专用前向。
     # LongCat-Video
     if isinstance(dit, LongCatVideoTransformer3DModel):
         return model_fn_longcat_video(
@@ -1196,6 +1528,7 @@ def model_fn_wan_video(
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
         
+    # S2V：当存在 `audio_embeds` 时走语音驱动分支（不会执行下方的通用 Wan DiT 路径）。
     # wan2.2 s2v
     if audio_embeds is not None:
         return model_fn_wans2v(
@@ -1212,14 +1545,18 @@ def model_fn_wan_video(
             use_unified_sequence_parallel=use_unified_sequence_parallel,
         )
 
+    # USP（Unified Sequence Parallel）：把序列维（patch tokens）分片到多卡并行计算，降低单卡显存与耗时。
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import (get_sequence_parallel_rank,
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
 
+    # time embedding / modulation：把 `timestep` 映射到 DiT 的调制向量（后续各 block 会用到）。
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+        # 对 fused-embedding 的 TI2V：将首帧 token 的 timestep 置 0，其余 token 使用当前 timestep，
+        # 并把 timestep 展开到每个 patch token（`seperated_timestep` 模式）。
         timestep = torch.concat([
             torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
             torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
@@ -1240,12 +1577,14 @@ def model_fn_wan_video(
     context = dit.text_embedding(context)
 
     x = latents
+    # CFG merge：当 context 的 batch 为 2（posi+nega 合并）而 latents 仍为 1 时，将 latents/timestep 复制到 2B 对齐。
     # Merged cfg
     if x.shape[0] != context.shape[0]:
         x = torch.concat([x] * context.shape[0], dim=0)
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
 
+    # 条件注入：`y` 走 channel 拼接，`clip_feature` 走 token 拼接（进入 context 序列）。
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
         x = torch.cat([x, y], dim=1)
@@ -1264,6 +1603,7 @@ def model_fn_wan_video(
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
     
+    # reference_latents 会被拼到 token 序列前部（等价于额外的一帧 token），并同步增加 f 用于后续 RoPE。
     # Reference image
     if reference_latents is not None:
         if len(reference_latents.shape) == 5:
@@ -1272,12 +1612,14 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
+    # RoPE freqs：为每个 patch token 生成 (t, h, w) 三维位置编码频率。
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    # VAP：当加载了 `vap` 模型时，会在若干指定 block 上把主干 hidden states 与 VAP hidden states 做交互更新。
     # VAP 
     if vap is not None:
         # hidden state
@@ -1297,12 +1639,14 @@ def model_fn_wan_video(
         context_vap = vap.text_embedding(context_vap)
         context_vap = torch.cat([vap_clip_embedding, context_vap], dim=1)
     
+    # TeaCache：根据 timestep 调制变化判断是否跳过 blocks 计算；跳过时用 residual 近似更新。
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, x, t_mod)
     else:
         tea_cache_update = False
         
+    # VACE：先前向计算所有 hint（按层映射），再在对应 block 后做 `x += hint * vace_scale` 注入。
     if vace_context is not None:
         vace_hints = vace(
             x, vace_context, context, t_mod, freqs,
@@ -1310,6 +1654,7 @@ def model_fn_wan_video(
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload
         )
     
+    # blocks：逐层 transformer；可叠加 USP 分片、TeaCache 跳过、VAP 交互、VACE hint 注入、Animate adapter。
     # blocks
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -1333,6 +1678,7 @@ def model_fn_wan_video(
         for block_id, block in enumerate(dit.blocks):
             # Block
             if vap is not None and block_id in vap.mot_layers_mapping:
+                # VAP 交互层：同时更新主干 `x` 与 `x_vap`。
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x, x_vap = torch.utils.checkpoint.checkpoint(
@@ -1350,6 +1696,7 @@ def model_fn_wan_video(
                     x, x_vap = vap(block, x, context, t_mod, freqs, x_vap, context_vap, t_mod_vap, freqs_vap, block_id)
             else:
                 if use_gradient_checkpointing_offload:
+                    # offload checkpoint：保存激活到 CPU，进一步降低显存峰值（代价是更慢）。
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
@@ -1357,6 +1704,7 @@ def model_fn_wan_video(
                             use_reentrant=False,
                         )
                 elif use_gradient_checkpointing:
+                    # 常规 checkpoint：以计算换显存。
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs,
@@ -1367,6 +1715,7 @@ def model_fn_wan_video(
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
+                # 按层映射注入 VACE hint。
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
                 if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
                     current_vace_hint = torch.chunk(current_vace_hint, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
@@ -1375,10 +1724,12 @@ def model_fn_wan_video(
             
             # Animate
             if pose_latents is not None and face_pixel_values is not None:
+                # Animate：在每层后注入 motion 相关的 adapter 更新。
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
         if tea_cache is not None:
             tea_cache.store(x)
             
+    # head：把 token 序列映射回 latent 空间的噪声预测。
     x = dit.head(x, t)
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -1386,6 +1737,7 @@ def model_fn_wan_video(
             x = x[:, :-pad_shape] if pad_shape > 0 else x
     # Remove reference latents
     if reference_latents is not None:
+        # 去掉前面拼进去的 reference tokens，只保留原始视频 token 对应的预测。
         x = x[:, reference_latents.shape[1]:]
         f -= 1
     x = dit.unpatchify(x, (f, h, w))
@@ -1401,6 +1753,17 @@ def model_fn_longcat_video(
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
 ):
+    """LongCat-Video 的单步去噪前向。
+
+    该分支在 `model_fn_wan_video` 中通过 `isinstance(dit, LongCatVideoTransformer3DModel)` 触发。
+
+    输入：
+      - `latents`：当前 noisy latent（BCTHW）
+      - `longcat_latents`：可选的条件 latent，会覆盖 `latents` 的前若干帧
+
+    输出：
+      - 噪声预测（与 `latents` 同形状）
+    """
     if longcat_latents is not None:
         latents[:, :, :longcat_latents.shape[2]] = longcat_latents
         num_cond_latents = longcat_latents.shape[2]
@@ -1435,6 +1798,18 @@ def model_fn_wans2v(
     use_gradient_checkpointing=False,
     use_unified_sequence_parallel=False,
 ):
+    """Wan2.2 S2V（Speech-to-Video）的单步去噪前向。
+
+    该分支在 `model_fn_wan_video` 中通过 `audio_embeds is not None` 触发。
+
+    形状约定：
+      - `latents`：`B C (1 + T) H W`，其中时间维的第 0 帧是 reference latent（`origin_ref_latents`），
+        后续 `T` 帧是待生成序列（`x`）。
+      - `motion_latents` / `s2v_pose_latents`：用于条件注入的额外 latent（可为空）。
+
+    输出：
+      - 噪声预测（与输入 `latents` 同形状，末尾会把 reference latent 再拼回以与 WanVideo 主流程兼容）。
+    """
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import (get_sequence_parallel_rank,
