@@ -367,10 +367,171 @@ def training_weight(self, timestep):
 
 ---
 
+## 5. 视频 SFT 训练细节
 
+### 5.1 视频 Latent 的形状与加噪方式
 
+**核心问题**：加噪是针对整个视频还是单独某一帧？
 
-### 5.3 完整训练步骤流程图
+**答案**：整个视频的所有帧**同时加噪**，使用同一个噪声强度 σ。
+
+```python
+# input_latents 形状：[B, C, T, H, W]
+# 例如：[1, 16, 13, 60, 104]
+#       B=1, C=16(latent channels), T=13(时间帧), H=60, W=104
+
+noise = torch.randn_like(inputs["input_latents"])  # 同形状的噪声
+# noise 形状也是 [1, 16, 13, 60, 104]
+
+# 所有帧用同一个 sigma 加噪
+xt = (1 - σ) * x0 + σ * ε  # 对整个 [B,C,T,H,W] tensor 操作
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  标准 Flow Matching SFT 加噪方式                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  x0 (干净视频):                                                  │
+│  ┌─────┬─────┬─────┬─────┬─────┐                               │
+│  │ f0  │ f1  │ f2  │ ... │ fT  │  所有帧都是干净的               │
+│  └─────┴─────┴─────┴─────┴─────┘                               │
+│           ↓  同一个 σ 同时加噪                                   │
+│  xt (带噪视频):                                                  │
+│  ┌─────┬─────┬─────┬─────┬─────┐                               │
+│  │ f0' │ f1' │ f2' │ ... │ fT' │  所有帧噪声程度相同 σ           │
+│  └─────┴─────┴─────┴─────┴─────┘                               │
+│                                                                 │
+│  特点：没有"干净历史帧"的概念，所有帧处于同一噪声水平              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 模型预测目标
+
+**核心问题**：模型预测的是什么？需要预测每一帧对应的 v 吗？
+
+**答案**：模型预测整个视频所有帧的 velocity field `v = ε - x0`，一次 forward 输出完整视频的预测。
+
+```python
+# 模型输入
+noise_pred = pipe.model_fn(
+    **models,
+    latents=xt,           # [B, C, T, H, W] - 带噪的完整视频
+    timestep=timestep,    # 标量 - 当前时间步
+    ...
+)
+
+# 模型输出
+# noise_pred 形状：[B, C, T, H, W] - 与输入相同
+# 每个位置 (b, c, t, h, w) 都有一个预测值
+```
+
+从 `unpatchify` 可以看到输出重构过程：
+
+```python
+# 位置: diffsynth/models/wan_video_dit.py:346-351
+def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
+    return rearrange(
+        x, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
+        f=grid_size[0],  # 时间维
+        h=grid_size[1],  # 高度
+        w=grid_size[2],  # 宽度
+        x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
+    )
+```
+
+### 5.3 Attention 机制
+
+**核心问题**：是否需要干净的历史帧？是否需要特殊的 attention map？
+
+**答案**：Wan 使用**全局 3D Self-Attention（非因果）**，不需要干净历史帧或特殊 mask。
+
+```python
+# 位置: diffsynth/models/wan_video_dit.py:139-145
+class SelfAttention(nn.Module):
+    def forward(self, x, freqs):
+        q = self.norm_q(self.q(x))
+        k = self.norm_k(self.k(x))
+        v = self.v(x)
+        q = rope_apply(q, freqs, self.num_heads)  # 3D RoPE 位置编码
+        k = rope_apply(k, freqs, self.num_heads)
+        x = self.attn(q, k, v)  # 全局注意力，无 causal mask
+        return self.o(x)
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Wan 3D Self-Attention                                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Patchify 后的 token 序列：                                      │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐            │
+│  │t0 │t0 │t0 │t1 │t1 │t1 │t2 │t2 │t2 │...│tT │tT │            │
+│  │p0 │p1 │p2 │p0 │p1 │p2 │p0 │p1 │p2 │   │pN │pN │            │
+│  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘            │
+│    ↑                                                            │
+│    所有 token 在 self-attention 中互相可见                        │
+│                                                                 │
+│  Attention 特点：                                                │
+│  ✓ 全局注意力（Non-causal）：每个 token 可以看到所有其他 token    │
+│  ✓ 3D RoPE：位置编码包含 (t, h, w) 三维信息                      │
+│  ✗ 不是因果注意力：未来帧可以看到过去帧，反之亦然                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 TI2V（Text-Image-to-Video）的特殊处理
+
+对于 TI2V 任务，第一帧（input_image）有特殊处理：
+
+```python
+# 位置: diffsynth/pipelines/wan_video.py:655-662
+def process(self, pipe, input_image, latents, ...):
+    if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
+        return {}
+    # 第一帧直接用 VAE 编码的干净 latent 替换
+    z = pipe.vae.encode([image], ...)
+    latents[:, :, 0:1] = z  # 替换第一帧！
+    return {"latents": latents, ...}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  TI2V 训练的特殊情况                                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  如果 fuse_vae_embedding_in_latents=True：                      │
+│                                                                 │
+│  latents[:, :, 0:1] 被替换为 input_image 的 VAE 编码            │
+│                                                                 │
+│  ┌───────┬─────┬─────┬─────┬─────┐                             │
+│  │ f0    │ f1' │ f2' │ ... │ fT' │                             │
+│  │(干净) │(加噪)│(加噪)│     │(加噪)│                             │
+│  └───────┴─────┴─────┴─────┴─────┘                             │
+│     ↑                                                           │
+│     第一帧保持干净（条件图像）                                     │
+│                                                                 │
+│  这种情况下，模型学习的是：                                       │
+│  "给定干净的第一帧 + 带噪的后续帧，预测整个视频的 velocity"        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.5 训练方式对比总结
+
+| 问题 | 标准 SFT | TI2V (fuse_vae_embedding) |
+|------|----------|---------------------------|
+| 加噪范围 | 所有帧 | 除第一帧外的所有帧 |
+| 干净历史帧 | 无 | 第一帧保持干净 |
+| Attention | 全局 3D（非因果） | 全局 3D（非因果） |
+| 预测目标 | 整个视频的 v | 整个视频的 v |
+
+> **关键点**：标准 Flow Matching SFT **不需要** autoregressive 式的因果注意力或干净历史帧。模型在训练时看到的是整个视频同时处于某个噪声水平，学习从该噪声状态恢复整个视频。这与 World Model 类的 autoregressive 视频生成不同。
+
+---
+
+### 5.6 完整训练步骤流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
